@@ -1,0 +1,14 @@
+[Unit]
+Description=SSD1306 OLED System Display
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/umersani/oled-display/oled_display.py
+Restart=on-failure
+RestartSec=5
+User=umersani
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
