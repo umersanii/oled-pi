@@ -8,6 +8,16 @@ A Python daemon that drives a 128×64 SSD1306 OLED over I2C on a Raspberry Pi, r
 
 ---
 
+## Hardware
+
+| Component | Details |
+|-----------|---------|
+| **SBC** | Raspberry Pi 4 Model B (4 GB RAM) |
+| **OS** | Debian GNU/Linux 12 (Bookworm), aarch64 |
+| **Display** | SSD1306 0.96" OLED, 128×64, I2C |
+
+---
+
 ## Wiring (SSD1306 → Raspberry Pi 4)
 
 | OLED Pin | Pi Pin | GPIO |
