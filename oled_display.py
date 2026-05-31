@@ -4,13 +4,12 @@ OLED system display daemon for Raspberry Pi 4.
 Rotates through three info pages on a 128x64 SSD1306 over I2C.
 
 Run:  python3 oled_display.py
-Service: sudo systemctl start oled-display
+Service: sudo systemctl start oled_display
 """
 
 import signal
 import socket
 import subprocess
-import sys
 import time
 
 import psutil
@@ -23,14 +22,16 @@ I2C_PORT    = 1
 I2C_ADDRESS = 0x3C
 PAGE_SECS   = 5      # seconds each page is shown
 UPDATE_HZ   = 10     # redraws per second while a page is shown
+TEMP_WARN   = 70.0   # °C — alert threshold (matches BadComputer)
 
 SERVICES = [
-    ("BadComp", "badcomputer"),
-    ("NPM",     "nginx-proxy-manager"),
-    ("Docker",  "docker"),
+    ("BadComp", "badcomputer",           "systemd"),
+    ("OLED",    "oled_display",          "systemd"),   # underscore — not oled-display
+    ("Docker",  "docker",                "systemd"),
+    ("NPM",     "nginx-proxy-manager",   "docker"),
 ]
 
-# ── Device setup ─────────────────────────────────────────────────────────────
+# ── Device setup ──────────────────────────────────────────────────────────────
 def make_device():
     serial = i2c(port=I2C_PORT, address=I2C_ADDRESS)
     return ssd1306(serial, width=128, height=64)
@@ -75,8 +76,15 @@ def tailscale_ip():
     except Exception:
         return "not connected"
 
-def service_status(name):
+def service_status(name, kind="systemd"):
     try:
+        if kind == "docker":
+            r = subprocess.run(
+                ["docker", "inspect", "--format={{.State.Status}}", name],
+                capture_output=True, text=True, timeout=2
+            )
+            status = r.stdout.strip()
+            return "active" if status == "running" else (status or "inactive")
         r = subprocess.run(
             ["systemctl", "is-active", name],
             capture_output=True, text=True, timeout=2
@@ -86,7 +94,7 @@ def service_status(name):
         return "unknown"
 
 def uptime():
-    secs = int(time.monotonic())
+    secs = int(time.time() - psutil.boot_time())
     d, rem = divmod(secs, 86400)
     h, rem = divmod(rem, 3600)
     m = rem // 60
@@ -94,45 +102,80 @@ def uptime():
         return f"{d}d {h}h {m}m"
     return f"{h}h {m}m"
 
+# Net I/O baseline — updated on each call to net_io_kbps()
+_net_snap = (psutil.net_io_counters(), time.monotonic())
 
-# ── Pages ─────────────────────────────────────────────────────────────────────
+def net_io_kbps():
+    global _net_snap
+    prev, prev_t = _net_snap
+    now = psutil.net_io_counters()
+    now_t = time.monotonic()
+    _net_snap = (now, now_t)
+    dt = now_t - prev_t
+    if dt < 0.01:
+        return 0.0, 0.0
+    tx = (now.bytes_sent - prev.bytes_sent) / dt / 1024
+    rx = (now.bytes_recv - prev.bytes_recv) / dt / 1024
+    return tx, rx
+
+def _fmt_rate(kbps):
+    if kbps >= 1024:
+        return f"{kbps / 1024:.1f}M"
+    if kbps >= 1:
+        return f"{kbps:.1f}K"
+    return f"{kbps * 1024:.0f}B"
+
+
+# ── Drawing helpers ────────────────────────────────────────────────────────────
 def draw_header(draw, title):
-    """Top bar with title and time."""
-    now = time.strftime("%H:%M:%S")
+    now = time.strftime("%I:%M %p")
     draw.rectangle([0, 0, 127, 11], fill="white")
     draw.text((2, 1), title, fill="black")
     draw.text((128 - len(now) * 6 - 2, 1), now, fill="black")
 
+def draw_bar(draw, x, y, w, h, pct):
+    draw.rectangle([x, y, x + w - 1, y + h - 1], outline="white")
+    fill_w = max(0, int((pct / 100.0) * (w - 2)))
+    if fill_w:
+        draw.rectangle([x + 1, y + 1, x + fill_w, y + h - 2], fill="white")
 
+
+# ── Pages ─────────────────────────────────────────────────────────────────────
 def page_stats(draw):
-    cpu = cpu_percent()
+    cpu  = cpu_percent()
     temp = cpu_temp()
     rp, ru, rt = ram()
-    dp, df, dt = disk()
+    dp, df, _  = disk()
+    warn = " !" if temp >= TEMP_WARN else ""
 
     draw_header(draw, "System Stats")
-    draw.text((0, 14), f"CPU:  {cpu:5.1f}%   {temp:.1f}C", fill="white")
-    draw.text((0, 26), f"RAM:  {rp:5.1f}%  {ru:.1f}/{rt:.1f}G", fill="white")
-    draw.text((0, 38), f"Disk: {dp:5.1f}%  {df:.0f}G free", fill="white")
-    draw.text((0, 50), f"Up: {uptime()}", fill="white")
+    draw.text((0, 13), f"CPU: {cpu:5.1f}%  {temp:.1f}C{warn}", fill="white")
+    draw_bar(draw,  0, 22, 128, 4, cpu)
+    draw.text((0, 27), f"RAM: {rp:5.1f}%  {ru:.1f}/{rt:.1f}G", fill="white")
+    draw_bar(draw,  0, 36, 128, 4, rp)
+    draw.text((0, 41), f"Disk:{dp:5.1f}%  {df:.0f}G free",     fill="white")
+    draw_bar(draw,  0, 50, 128, 4, dp)
+    draw.text((0, 55), f"Up: {uptime()}",                       fill="white")
 
 
 def page_network(draw):
-    lip  = local_ip()
-    tsip = tailscale_ip()
-    host = socket.gethostname()
+    lip      = local_ip()
+    tsip     = tailscale_ip()
+    host     = socket.gethostname()
+    tx, rx   = net_io_kbps()
 
     draw_header(draw, "Network")
-    draw.text((0, 14), f"Host: {host}",  fill="white")
-    draw.text((0, 26), f"LAN:  {lip}",   fill="white")
-    draw.text((0, 38), f"VPN:  {tsip}",  fill="white")
+    draw.text((0, 13), f"Host: {host}",                              fill="white")
+    draw.text((0, 26), f"LAN:  {lip}",                              fill="white")
+    draw.text((0, 39), f"VPN:  {tsip}",                             fill="white")
+    draw.text((0, 52), f"TX:{_fmt_rate(tx)}  RX:{_fmt_rate(rx)}",  fill="white")
 
 
 def page_services(draw):
     draw_header(draw, "Services")
     y = 14
-    for label, svc in SERVICES:
-        status = service_status(svc)
+    for label, svc, kind in SERVICES:
+        status = service_status(svc, kind)
         dot = "+" if status == "active" else "-"
         draw.text((0, y), f"[{dot}] {label}: {status}", fill="white")
         y += 12
@@ -157,8 +200,7 @@ class Runner:
         page_start = time.monotonic()
         interval = 1.0 / UPDATE_HZ
 
-        # prime cpu_percent (first call always returns 0.0)
-        psutil.cpu_percent(interval=None)
+        psutil.cpu_percent(interval=None)   # prime — first call always returns 0.0
 
         print(f"oled-display running — {len(PAGES)} pages, {PAGE_SECS}s each")
 
@@ -173,10 +215,8 @@ class Runner:
                 PAGES[page_idx](draw)
 
             elapsed = time.monotonic() - tick
-            sleep = max(0.0, interval - elapsed)
-            time.sleep(sleep)
+            time.sleep(max(0.0, interval - elapsed))
 
-        # blank on exit
         with canvas(device) as draw:
             draw.rectangle([0, 0, 127, 63], fill="black")
 
